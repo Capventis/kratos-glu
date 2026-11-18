@@ -1,0 +1,117 @@
+# Builds the patched Glu base image of Ory Kratos and pushes it to
+# ghcr.io/capventis/kratos. gluplatform-auth builds on top of this image
+# (UPSTREAM_KRATOS_IMAGE in its .env).
+#
+# Release: `task tag` pushes UPSTREAM-glu.VERSION, e.g. `v26.2.0-glu.1.0.0`
+# (upstream Ory release + glu major.minor.patch from VERSION).
+# Manual runs build and scan the image but never push it.
+
+name: Glu Kratos Image
+
+on:
+  push:
+    tags:
+      - "v*-glu.*"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/capventis/kratos
+  REPO: ${{ github.repository }}
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Container Registry Login
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.url=https://ghcr.io/capventis/kratos
+            org.opencontainers.image.title=kratos
+            org.opencontainers.image.description=Ory Kratos, patched Glu base image
+            org.opencontainers.image.source=https://github.com/${{ env.REPO }}
+
+      # Build for the runner's architecture only and load it into the local
+      # daemon, so the image can be scanned before anything is pushed.
+      - name: Build image for scanning
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: .docker/Dockerfile-glu
+          load: true
+          push: false
+          tags: kratos-glu:scan
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Fail on any HIGH/CRITICAL that has a fix available. Unfixed findings
+      # (e.g. docker/docker, pgproto3/v2) are reported but do not block.
+      - name: Scan image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: kratos-glu:scan
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Build and push Docker image
+        id: push
+        if: github.ref_type == 'tag'
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: .docker/Dockerfile-glu
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          cache-from: type=gha
+          provenance: mode=max
+          sbom: true
+
+      - name: Summary
+        if: github.ref_type == 'tag'
+        run: |
+          {
+            echo "### Pushed ${IMAGE}"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo "Pin in gluplatform-auth: \`${IMAGE}:${{ github.ref_name }}@${{ steps.push.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

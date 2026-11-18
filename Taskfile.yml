@@ -1,0 +1,126 @@
+version: "3"
+
+# Glu tasks for the patched Ory Kratos base image.
+#
+# Versioning: VERSION holds the glu version (major.minor.patch). Tags and image
+# tags are the upstream Ory release plus that version:
+#
+#   v26.2.0-glu.1.0.0  ->  ghcr.io/capventis/kratos:v26.2.0-glu.1.0.0
+#
+# Pushing such a tag runs .github/workflows/glu-image.yml, which scans and
+# publishes the image.
+
+vars:
+  IMAGE: ghcr.io/capventis/kratos
+  DOCKERFILE: .docker/Dockerfile-glu
+  # Upstream release this branch is based on, e.g. v26.2.0.
+  UPSTREAM_VERSION:
+    sh: git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-glu*' HEAD
+  GLU_VERSION:
+    sh: cat VERSION
+  TAG: "{{.UPSTREAM_VERSION}}-glu.{{.GLU_VERSION}}"
+  # Version baked into the binary: the tag when HEAD is tagged, else TAG-dev.
+  BUILD_VERSION:
+    sh: git describe --tags --exact-match --match '*-glu*' 2>/dev/null || echo "{{.TAG}}-dev"
+  COMMIT:
+    sh: git rev-parse HEAD
+  BUILD_DATE:
+    sh: date -u +%Y-%m-%dT%H:%M:%SZ
+  BUILD_ARGS: >-
+    --build-arg "VERSION={{.BUILD_VERSION}}"
+    --build-arg "COMMIT={{.COMMIT}}"
+    --build-arg "BUILD_DATE={{.BUILD_DATE}}"
+
+tasks:
+  image:
+    desc: Build Glu Kratos Docker Image
+    silent: true
+    cmds:
+      - echo building {{.IMAGE}}:{{.BUILD_VERSION}}
+      - docker build --file {{.DOCKERFILE}} {{.BUILD_ARGS}} -t {{.IMAGE}}:{{.BUILD_VERSION}} .
+
+  local_image:
+    desc: Build Glu Kratos Docker Image as kratos-glu (for gluplatform-auth UPSTREAM_KRATOS_IMAGE)
+    silent: true
+    cmds:
+      - echo building kratos-glu {{.BUILD_VERSION}}
+      - docker build --file {{.DOCKERFILE}} {{.BUILD_ARGS}} -t kratos-glu . --no-cache
+
+  scan:
+    desc: Scan source with govulncheck and the local image with trivy (same gate as CI)
+    deps: [local_image]
+    cmds:
+      # Full report; govulncheck exits 3 on any finding, including unfixed ones.
+      - cmd: govulncheck ./...
+        ignore_error: true
+      # Gate: fail only on findings that have a fixed version (like trivy --ignore-unfixed).
+      - |
+        fixable=$(govulncheck -format json ./... | jq -r 'select(.finding) | .finding | select(.fixed_version) | "\(.osv) (fixed in \(.fixed_version))"' | sort -u)
+        if [ -n "$fixable" ]; then echo "govulncheck: fixable vulnerabilities found:"; echo "$fixable"; exit 1; fi
+        echo "govulncheck gate: no fixable vulnerabilities"
+      - trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 kratos-glu
+      - trivy image kratos-glu
+
+  test:
+    desc: Run the Go test suite
+    cmds:
+      - go test -count=1 ./...
+
+  version:
+    desc: Print the glu version and the tag it maps to
+    silent: true
+    cmds:
+      - echo "glu version {{.GLU_VERSION}} on upstream {{.UPSTREAM_VERSION}} -> tag {{.TAG}}"
+
+  bump_patch:
+    desc: Bump patch version number
+    cmds:
+      - task: _bump
+        vars: { PART: patch }
+
+  bump_minor:
+    desc: Bump minor version number
+    cmds:
+      - task: _bump
+        vars: { PART: minor }
+
+  bump_major:
+    desc: Bump major version number
+    cmds:
+      - task: _bump
+        vars: { PART: major }
+
+  _bump:
+    internal: true
+    vars:
+      VER:
+        sh: |
+          IFS=. read -r major minor patch < VERSION
+          case "{{.PART}}" in
+            major) echo "$((major + 1)).0.0" ;;
+            minor) echo "$major.$((minor + 1)).0" ;;
+            patch) echo "$major.$minor.$((patch + 1))" ;;
+          esac
+    cmds:
+      - git diff --quiet --exit-code && git diff --cached --quiet --exit-code || { echo "Commit changes before bumping"; exit 1; }
+      - echo "{{.VER}}" > VERSION
+      - git commit -m "Glu version {{.VER}} ({{.UPSTREAM_VERSION}}-glu.{{.VER}})" VERSION
+      - git push
+
+  tag:
+    desc: Tag repo with UPSTREAM-glu.VERSION (e.g. v26.2.0-glu.1.0.0) and push to origin
+    cmds:
+      - git diff --quiet --exit-code && git diff --cached --quiet --exit-code || { echo "Commit changes before tagging"; exit 1; }
+      - "! git rev-parse -q --verify refs/tags/{{.TAG}} >/dev/null || { echo 'Tag {{.TAG}} already exists, run a bump_* task first'; exit 1; }"
+      - git tag {{.TAG}} -m "Tag version {{.TAG}}" && echo "Tag version {{.TAG}}"
+      - git push origin {{.TAG}}
+
+  test_tag:
+    desc: Tag a test release (publishes a TAG-test-<date> image)
+    vars:
+      TEST_TAG:
+        sh: echo "{{.TAG}}-test-$(date '+%Y-%m-%d-%H-%M')"
+    cmds:
+      - git diff --quiet --exit-code && git diff --cached --quiet --exit-code || { echo "Commit changes before tagging"; exit 1; }
+      - git tag {{.TEST_TAG}} -m "Tag testing version {{.TEST_TAG}}" && echo "Tagged testing version {{.TEST_TAG}}"
+      - git push origin {{.TEST_TAG}}
